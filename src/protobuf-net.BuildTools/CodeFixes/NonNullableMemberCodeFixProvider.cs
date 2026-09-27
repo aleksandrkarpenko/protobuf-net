@@ -17,24 +17,29 @@ using System.Threading.Tasks;
 namespace ProtoBuf.CodeFixes
 {
     /// <summary>
-    /// Offers the remedies for PBN0028, a non-nullable collection that nothing initializes on
-    /// deserialize: declare it nullable, initialize it, or mark it <c>[NullWrappedCollection]</c>.
+    /// Offers the remedies for a non-nullable member that deserializes as null: PBN0028, a
+    /// collection nothing initializes, and PBN0030, anything else under <c>SkipConstructor</c> or
+    /// on a struct - declare it nullable, initialize it, or mark it <c>[NullWrappedCollection]</c>.
     /// </summary>
     /// <remarks>
     /// Each is offered only where it works, which the analyzer decides and passes along: an
     /// initializer does nothing under <c>SkipConstructor</c> or on a struct contract, since no
-    /// constructor runs; and null-wrapping does nothing on a member that is never written. The
-    /// null-wrapping title says it changes the wire format, because it does - the collection moves
-    /// inside a wrapper message, which existing payloads and the old schema do not have - and a
-    /// lightbulb is exactly where that is easy to accept without reading about it.
+    /// constructor runs - which is every PBN0030 - and null-wrapping only applies to a collection
+    /// that is written at all. The null-wrapping title says it changes the wire format, because it
+    /// does - the collection moves inside a wrapper message, which existing payloads and the old
+    /// schema do not have - and a lightbulb is exactly where that is easy to accept without reading
+    /// about it.
     /// </remarks>
-    [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(NonNullableCollectionCodeFixProvider)), Shared]
-    public class NonNullableCollectionCodeFixProvider : CodeFixProvider
+    [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(NonNullableMemberCodeFixProvider)), Shared]
+    public class NonNullableMemberCodeFixProvider : CodeFixProvider
     {
-        internal const string NullableKey = "PBN0028.Nullable", InitializeKey = "PBN0028.Initialize", NullWrapKey = "PBN0028.NullWrap";
+        internal const string NullableKey = "NonNullableMember.DeclareNullable",
+            InitializeKey = "NonNullableMember.Initialize",
+            NullWrapKey = "NonNullableMember.NullWrapCollection";
 
         /// <inheritdoc/>
-        public override ImmutableArray<string> FixableDiagnosticIds => ImmutableArray.Create(DataContractAnalyzer.NonNullableCollectionLeftNull.Id);
+        public override ImmutableArray<string> FixableDiagnosticIds => ImmutableArray.Create(
+            DataContractAnalyzer.NonNullableCollectionLeftNull.Id, DataContractAnalyzer.NonNullableMemberLeftNull.Id);
 
         /// <inheritdoc/>
         public override FixAllProvider GetFixAllProvider() => WellKnownFixAllProviders.BatchFixer;
@@ -114,17 +119,27 @@ namespace ProtoBuf.CodeFixes
                 // a field's type belongs to the enclosing declaration, not to the declarator
                 case VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax variables } variable:
                     var declarator = variable.Initializer is { } assigned && DataContractContext.IsSpelledOutNull(assigned.Value)
-                        ? variable.WithInitializer(null).WithIdentifier(variable.Identifier.WithoutTrivia())
+                        ? WithoutInitializer(variable)
                         : variable;
                     return root.ReplaceNode(variables, variables.ReplaceNode(variable, declarator).WithType(nullable));
-                case PropertyDeclarationSyntax { Initializer.Value: var value, AccessorList: { } accessors } property
-                    when DataContractContext.IsSpelledOutNull(value):
-                    return root.ReplaceNode(property, property.WithType(nullable).WithInitializer(null).WithSemicolonToken(default)
-                        .WithAccessorList(accessors.WithTrailingTrivia(property.SemicolonToken.TrailingTrivia)));
+                case PropertyDeclarationSyntax { Initializer.Value: var value } property when DataContractContext.IsSpelledOutNull(value):
+                    return root.ReplaceNode(property, ((PropertyDeclarationSyntax)WithoutInitializer(property)).WithType(nullable));
                 default:
                     return root.ReplaceNode(type, nullable);
             }
         }
+
+        // `= value` goes - and, on a property, the `;` that only existed to end it - with the trailing
+        // trivia kept where it was. Shared with the PBN0029 fix, which is nothing but this
+        internal static SyntaxNode WithoutInitializer(SyntaxNode declaration) => declaration switch
+        {
+            PropertyDeclarationSyntax { Initializer: not null, AccessorList: { } accessors } property
+                => property.WithInitializer(null).WithSemicolonToken(default)
+                    .WithAccessorList(accessors.WithTrailingTrivia(property.SemicolonToken.TrailingTrivia)),
+            VariableDeclaratorSyntax { Initializer: not null } variable
+                => variable.WithInitializer(null).WithIdentifier(variable.Identifier.WithoutTrivia()),
+            _ => declaration,
+        };
 
         // only what can be written without guessing: an empty one-dimensional array, or a class with
         // a public parameterless constructor. An interface or an immutable type would need a

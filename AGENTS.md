@@ -302,7 +302,7 @@ it.
 
 | block | owner |
 | --- | --- |
-| `PBN0001`–`PBN0028` | `DataContractAnalyzer` — `PBN0027` is taken on the `v4` branch, so is not free here either |
+| `PBN0001`–`PBN0030` | `DataContractAnalyzer` — `PBN0027` is taken on the `v4` branch, so is not free here either |
 | `PBN1000+` | `ProtoFileGenerator`'s schema errors |
 | **`PBN2001`–`PBN2010`** | **`ServiceContractAnalyzer`** (the gRPC analyzers, since #735) |
 | `PBN3000`–`PBN3005` | `ProtoModelGenerator` — the language floor, the four drop reasons, and the JSON refusal |

@@ -627,9 +627,14 @@ namespace ProtoBuf.BuildTools.Internal
             return false;
         }
 
+        // Not for a Nullable<T> either: that is written whenever it has a value, zero included, so
+        // IsRequired changes nothing on the wire (probed) - and alongside [NullWrappedValue] it makes
+        // protobuf-net refuse the model outright. What such a member can lose is null, and that is
+        // PBN0029's business, which IsRequired does not help with.
         /// <remarks>Ensure to validate member before (i.e. calculate default value of member)</remarks>
         private bool ShouldDeclareIsRequired(Member member)
-            => !member.IsRequired && !IsCollectionLike(member.MemberType);
+            => !member.IsRequired && !IsCollectionLike(member.MemberType)
+                && member.MemberType?.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T;
 
         // A collection member is exempt from the IsRequired nag: an empty collection has no wire
         // presence to force (repeated fields write per element), initializing to an empty collection
@@ -815,12 +820,18 @@ namespace ProtoBuf.BuildTools.Internal
         // member.Name + "Specified" where that member is the MemberInfo - which is why both use
         // MemberName rather than the possibly-renamed proto Name
         private static bool HasSpecifiedProperty(Member member)
-            => member.Symbol.ContainingType.GetMembers(member.MemberName + "Specified")
+            => HasSpecifiedProperty(member.Symbol.ContainingType, member.MemberName);
+
+        private static bool HasSpecifiedProperty(INamedTypeSymbol type, string memberName)
+            => type.GetMembers(memberName + "Specified")
                 .OfType<IPropertySymbol>()
                 .Any(prop => prop.Type.SpecialType == SpecialType.System_Boolean);
 
         private static bool HasShouldSerializeMethod(Member member)
-            => member.Symbol.ContainingType.GetMembers("ShouldSerialize" + member.MemberName)
+            => HasShouldSerializeMethod(member.Symbol.ContainingType, member.MemberName);
+
+        private static bool HasShouldSerializeMethod(INamedTypeSymbol type, string memberName)
+            => type.GetMembers("ShouldSerialize" + memberName)
                 .OfType<IMethodSymbol>()
                 .Any(method => method.ReturnType.SpecialType == SpecialType.System_Boolean);
 
@@ -862,7 +873,22 @@ namespace ProtoBuf.BuildTools.Internal
         // Reported per member, at the member, because each has a fix of its own - unlike PBN0026,
         // where no arrangement of the member helps. Only for a *non-nullable* reference: declaring it
         // nullable is one of those fixes, and the compiler then makes every reader deal with null.
-        internal void ReportCollectionsLeftNull(SyntaxNodeAnalysisContext context, INamedTypeSymbol type)
+        //
+        // The same walk serves two neighbours, since both turn on the same question of what
+        // construction leaves in a member that the payload does not carry:
+        //
+        // - PBN0030, the non-collection half of the above. A non-null string or message *is* written,
+        //   even empty, so between two protobuf-net peers on one schema it only goes missing from a
+        //   payload written before the member existed, or by a sender that omits "" (proto3, or
+        //   [DefaultValue("")] as protogen emits). That is too rare to nag every `required string`
+        //   about - the compiler's CS8618 has had its say there - so it is reported only where no
+        //   initializer can run: SkipConstructor and structs. There a member that is not serialized
+        //   at all - a lock object, a cache - is null after *every* deserialize.
+        // - PBN0029, the mirror image: a *nullable* member that an initializer makes non-null. Null
+        //   is not written, so the receiver keeps the initializer's value, and with [NullWrappedValue]
+        //   a zero or false goes the same way, since the wrapper is written empty. Only where the
+        //   initializer runs, and only for a member that is written at all.
+        internal void ReportNullsOnDeserialize(SyntaxNodeAnalysisContext context, INamedTypeSymbol type)
         {
             // with a surrogate protobuf-net constructs the surrogate and converts, and with a
             // hand-written serializer that serializer does the constructing - never us, either way
@@ -888,6 +914,7 @@ namespace ProtoBuf.BuildTools.Internal
                 : null;
 
             HashSet<string>? assignedByConstructor = null;
+            bool constructorsUnanswerable = false;
             HashSet<string>? restored = null;
             foreach (var candidate in type.GetMembers())
             {
@@ -910,8 +937,10 @@ namespace ProtoBuf.BuildTools.Internal
                         continue;
                 }
 
-                // an oblivious member has promised nothing, and a value type cannot be null
-                if (annotation != NullableAnnotation.NotAnnotated || !memberType.IsReferenceType) continue;
+                // an oblivious reference has promised nothing either way, and a plain value type
+                // cannot be null; Nullable<T> is nullable whatever the context says
+                bool nullableValue = memberType.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T;
+                if (!nullableValue && (!memberType.IsReferenceType || annotation == NullableAnnotation.None)) continue;
 
                 // a partial type is visited once per declaration; the part declaring the member owns
                 // it - tested before anything that walks interfaces or attributes, since every other
@@ -921,16 +950,67 @@ namespace ProtoBuf.BuildTools.Internal
                     || location.SourceTree != context.Node.SyntaxTree
                     || !context.Node.FullSpan.Contains(location.SourceSpan)) continue;
 
-                if (!IsRepeatedLike(memberType) || IgnoresListHandling(memberType) || IsNullWrappedCollection(member)) continue;
+                if (nullableValue || annotation == NullableAnnotation.Annotated)
+                {
+                    // PBN0029: only where the initializer runs, on a member that is written, and
+                    // where nothing else is managing presence - a {Name}Specified or
+                    // ShouldSerialize{Name} lets the receiver tell "absent" apart already
+                    if (notConstructed is not null || !HasProtoMember(member)
+                        || !HasNonNullInitializer(member, context.CancellationToken)
+                        || HasSpecifiedProperty(type, member.Name) || HasShouldSerializeMethod(type, member.Name)) continue;
+                    restored ??= AssignedInDeserializationCallbacks(type, context.CancellationToken);
+                    if (restored.Contains(member.Name)) continue;
+
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        descriptor: DataContractAnalyzer.NullableMemberInitialized,
+                        location: location,
+                        messageArgs: new object[]
+                        {
+                            member.Name,
+                            nullableValue && IsNullWrappedValue(member) && WrapsZeroAsEmpty(((INamedTypeSymbol)memberType).TypeArguments[0])
+                                ? ", as does a zero or false, which [NullWrappedValue] writes as an empty wrapper"
+                                : "",
+                        },
+                        additionalLocations: null,
+                        properties: null
+                    ));
+                    continue;
+                }
+
+                if (!IsRepeatedLike(memberType) || IgnoresListHandling(memberType))
+                {
+                    // PBN0030: a non-collection only goes missing where no initializer can run
+                    if (notConstructed is null) continue;
+                    restored ??= AssignedInDeserializationCallbacks(type, context.CancellationToken);
+                    if (restored.Contains(member.Name)) continue;
+
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        descriptor: DataContractAnalyzer.NonNullableMemberLeftNull,
+                        location: location,
+                        messageArgs: new object[] { member.Name, notConstructed },
+                        additionalLocations: null,
+                        // the same code fix serves it, and "not constructed" is what rules out
+                        // every remedy but declaring it nullable
+                        properties: DiagnosticPropertiesBuilder.Create()
+                            .Add(CollectionLeftNullConstructedKey, "false")
+                            .Build()
+                    ));
+                    continue;
+                }
+
+                if (IsNullWrappedCollection(member)) continue;
 
                 if (notConstructed is null)
                 {
                     if (HasNonNullInitializer(member, context.CancellationToken)) continue;
-                    // worked out once, and only for a type that has a candidate; nothing has been
-                    // reported before the first time, so a type with no answer reports nothing
-                    if (assignedByConstructor is null
-                        && !TryGetAssignedByConstructor(type, context.CancellationToken, out assignedByConstructor)) return;
-                    if (assignedByConstructor.Contains(member.Name)) continue;
+                    // worked out once, and only for a type that has a candidate; a type with no
+                    // answer - a `: this(...)` chain, or no constructor to call - reports no
+                    // collection that would rest on it
+                    if (assignedByConstructor is null)
+                    {
+                        constructorsUnanswerable = !TryGetAssignedByConstructor(type, context.CancellationToken, out assignedByConstructor);
+                    }
+                    if (constructorsUnanswerable || assignedByConstructor.Contains(member.Name)) continue;
                 }
 
                 restored ??= AssignedInDeserializationCallbacks(type, context.CancellationToken);
@@ -939,8 +1019,7 @@ namespace ProtoBuf.BuildTools.Internal
                 // [NullWrappedCollection] only means anything on a member that is written at all, and
                 // is only offered where [ProtoMember] says so - conservative, since ImplicitFields and
                 // [DataMember] also serialize, but it never suggests wrapping something that is not
-                bool hasProtoMember = member.GetAttributes().Any(attrib
-                    => attrib.AttributeClass is { Name: nameof(ProtoMemberAttribute) } ac && ac.InProtoBufNamespace());
+                bool hasProtoMember = HasProtoMember(member);
                 bool constructed = notConstructed is null;
 
                 context.ReportDiagnostic(Diagnostic.Create(
@@ -1101,6 +1180,29 @@ namespace ProtoBuf.BuildTools.Internal
         private static bool IsNullWrappedCollection(ISymbol member)
             => member.GetAttributes().Any(attrib => attrib.AttributeClass is { Name: nameof(NullWrappedCollectionAttribute) } ac
                 && ac.InProtoBufNamespace());
+
+        private static bool IsNullWrappedValue(ISymbol member)
+            => member.GetAttributes().Any(attrib => attrib.AttributeClass is { Name: nameof(NullWrappedValueAttribute) } ac
+                && ac.InProtoBufNamespace());
+
+        private static bool HasProtoMember(ISymbol member)
+            => member.GetAttributes().Any(attrib => attrib.AttributeClass is { Name: nameof(ProtoMemberAttribute) } ac
+                && ac.InProtoBufNamespace());
+
+        // inside a [NullWrappedValue] wrapper the value is an ordinary field at 1, so a zero or false
+        // is left out and the wrapper goes out empty - and an empty wrapper, read into an existing
+        // value, leaves it alone (probed for bool, char, byte, int, uint, long, float and double). Not
+        // so for an enum, whose zero is written explicitly, nor a string, which is written even empty
+        private static bool WrapsZeroAsEmpty(ITypeSymbol valueType) => valueType.SpecialType switch
+        {
+            SpecialType.System_Boolean or SpecialType.System_Char
+            or SpecialType.System_SByte or SpecialType.System_Byte
+            or SpecialType.System_Int16 or SpecialType.System_UInt16
+            or SpecialType.System_Int32 or SpecialType.System_UInt32
+            or SpecialType.System_Int64 or SpecialType.System_UInt64
+            or SpecialType.System_Single or SpecialType.System_Double => true,
+            _ => false,
+        };
 
         // The names a deserialization callback assigns: the one thing that restores a member however
         // the instance was made, since it runs on the new instance before or after the fields are

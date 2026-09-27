@@ -37,9 +37,13 @@ public class WithEnums
     [ProtoMember(10)] public AsInt32? MaybeEnum { get; set; }
 
     // declared default on an enum, and on a nullable enum; the initialisers are required, since
-    // [DefaultValue] affects writing only and is otherwise lossy across a round-trip
+    // [DefaultValue] affects writing only and is otherwise lossy across a round-trip. The nullable
+    // one pays for its initialiser in nulls - a null is not written, so it comes back as AB - which
+    // is PBN0029's point and why no sample below sends one; it is here to pin the write guard
     [ProtoMember(11), DefaultValue(AsInt32.Neg)] public AsInt32 EnumWithDefault { get; set; } = AsInt32.Neg;
+#pragma warning disable PBN0029 // a nullable member's initializer turns null into a value
     [ProtoMember(12), DefaultValue(Flagged.AB)] public Flagged? MaybeFlagsWithDefault { get; set; } = Flagged.AB;
+#pragma warning restore PBN0029
 
     // char is not an enum base, but is an adjacent scalar gap
     [ProtoMember(13)] public char Character { get; set; }

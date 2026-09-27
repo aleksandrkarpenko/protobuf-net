@@ -15,7 +15,7 @@ using Xunit;
 
 namespace BuildToolsUnitTests.CodeFixes
 {
-    public class NonNullableCollectionCodeFixProviderTests : CodeFixProviderTestsBase<NonNullableCollectionCodeFixProvider>
+    public class NonNullableMemberCodeFixProviderTests : CodeFixProviderTestsBase<NonNullableMemberCodeFixProvider>
     {
         private readonly DiagnosticResult[] _standardExpectedDiagnostics = new[] {
             new DiagnosticResult(DataContractAnalyzer.MissingCompatibilityLevel)
@@ -47,8 +47,15 @@ using PM = ProtoBuf.ProtoMemberAttribute;
         [InlineData(
             "[ProtoContract(SkipConstructor = true)] public record TestRecord([property: ProtoMember(1)] string[] {|PBN0028:Array|});",
             "[ProtoContract(SkipConstructor = true)] public record TestRecord([property: ProtoMember(1)] string[]? Array);")]
+        // PBN0030, the non-collection half, gets the same fix
+        [InlineData(
+            "[ProtoContract(SkipConstructor = true)] public class Foo { [ProtoMember(1)] public string {|PBN0030:Name|} { get; set; } }",
+            "[ProtoContract(SkipConstructor = true)] public class Foo { [ProtoMember(1)] public string? Name { get; set; } }")]
+        [InlineData(
+            "[ProtoContract(SkipConstructor = true)] public record Person([property: ProtoMember(1)] string {|PBN0030:Name|});",
+            "[ProtoContract(SkipConstructor = true)] public record Person([property: ProtoMember(1)] string? Name);")]
         public Task DeclaresNullable(string source, string expected)
-            => RunAsync(source, expected, NonNullableCollectionCodeFixProvider.NullableKey);
+            => RunAsync(source, expected, NonNullableMemberCodeFixProvider.NullableKey);
 
         [Theory]
         [InlineData(
@@ -65,7 +72,7 @@ using PM = ProtoBuf.ProtoMemberAttribute;
             "[ProtoContract] public class Foo { [ProtoMember(1)] public required HashSet<string> {|PBN0028:Items|} { get; init; } }",
             "[ProtoContract] public class Foo { [ProtoMember(1)] public required HashSet<string> Items { get; init; } = new(); }")]
         public Task Initializes(string source, string expected)
-            => RunAsync(source, expected, NonNullableCollectionCodeFixProvider.InitializeKey);
+            => RunAsync(source, expected, NonNullableMemberCodeFixProvider.InitializeKey);
 
         [Theory]
         [InlineData(
@@ -83,26 +90,29 @@ using PM = ProtoBuf.ProtoMemberAttribute;
             "[ProtoContract] public class Foo { [PM(1)] public IList<int> {|PBN0028:Items|} { get; set; } = null!; }",
             "[ProtoContract] public class Foo { [PM(1), NullWrappedCollection] public IList<int> Items { get; set; } = null!; }")]
         public Task NullWraps(string source, string expected)
-            => RunAsync(source, expected, NonNullableCollectionCodeFixProvider.NullWrapKey);
+            => RunAsync(source, expected, NonNullableMemberCodeFixProvider.NullWrapKey);
 
         // each remedy is offered only where it works: an initializer needs a constructor that runs
         // and a type we can name without guessing, and null-wrapping needs a member that is written
         [Theory]
         [InlineData("[ProtoContract] public class Foo { [ProtoMember(1)] public List<int> Items { get; set; } = null!; }",
-            "PBN0028.Nullable", "PBN0028.Initialize", "PBN0028.NullWrap")]
+            "NonNullableMember.DeclareNullable", "NonNullableMember.Initialize", "NonNullableMember.NullWrapCollection")]
         [InlineData("[ProtoContract(SkipConstructor = true)] public class Foo { [ProtoMember(1)] public List<int> Items { get; set; } = new(); }",
-            "PBN0028.Nullable", "PBN0028.NullWrap")]
+            "NonNullableMember.DeclareNullable", "NonNullableMember.NullWrapCollection")]
         [InlineData("[ProtoContract] public struct Foo { [ProtoMember(1)] public List<int> Items; }",
-            "PBN0028.Nullable", "PBN0028.NullWrap")]
+            "NonNullableMember.DeclareNullable", "NonNullableMember.NullWrapCollection")]
         [InlineData("[ProtoContract(SkipConstructor = true)] public record TestRecord([property: ProtoMember(1)] string[] Array);",
-            "PBN0028.Nullable", "PBN0028.NullWrap")]
+            "NonNullableMember.DeclareNullable", "NonNullableMember.NullWrapCollection")]
         [InlineData("[ProtoContract] public class Foo { public List<int> Items { get; set; } = null!; }",
-            "PBN0028.Nullable", "PBN0028.Initialize")]
+            "NonNullableMember.DeclareNullable", "NonNullableMember.Initialize")]
         [InlineData("[ProtoContract] public class Foo { [ProtoMember(1)] public IList<int> Items { get; set; } = null!; }",
-            "PBN0028.Nullable", "PBN0028.NullWrap")]
+            "NonNullableMember.DeclareNullable", "NonNullableMember.NullWrapCollection")]
+        // nothing is constructed and there is no collection to wrap, so only declaring it nullable is left
+        [InlineData("[ProtoContract(SkipConstructor = true)] public class Foo { [ProtoMember(1)] public string Name { get; set; } }",
+            "NonNullableMember.DeclareNullable")]
         // `List<int>?` would change A as well as B, so only the initializer is offered
         [InlineData("[ProtoContract] public class Foo { public List<int> A = new(), B; }",
-            "PBN0028.Initialize")]
+            "NonNullableMember.Initialize")]
         public async Task OffersOnlyWhatWorks(string source, params string[] expected)
         {
             var offered = await OfferedFixesAsync(Wrap(source));
@@ -122,11 +132,12 @@ namespace System.Runtime.CompilerServices { public class IsExternalInit {} }");
             var diagnostics = await compilation
                 .WithAnalyzers(ImmutableArray.Create<DiagnosticAnalyzer>(new DataContractAnalyzer()))
                 .GetAnalyzerDiagnosticsAsync();
-            var diagnostic = Assert.Single(diagnostics, x => x.Descriptor == DataContractAnalyzer.NonNullableCollectionLeftNull);
+            var diagnostic = Assert.Single(diagnostics, x => x.Descriptor == DataContractAnalyzer.NonNullableCollectionLeftNull
+                || x.Descriptor == DataContractAnalyzer.NonNullableMemberLeftNull);
 
             var offered = new List<string>();
             var context = new CodeFixContext(document, diagnostic, (action, _) => offered.Add(action.EquivalenceKey!), CancellationToken.None);
-            await new NonNullableCollectionCodeFixProvider().RegisterCodeFixesAsync(context);
+            await new NonNullableMemberCodeFixProvider().RegisterCodeFixesAsync(context);
             return offered;
         }
     }

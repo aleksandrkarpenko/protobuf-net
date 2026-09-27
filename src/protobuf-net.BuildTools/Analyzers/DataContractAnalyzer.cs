@@ -243,6 +243,24 @@ internal static readonly DiagnosticDescriptor DeclaredAndIgnored = new(
             isEnabledByDefault: true,
             helpLinkUri: "https://docs.protobuf-net.dev/rules/PBN0028");
 
+        internal static readonly DiagnosticDescriptor NullableMemberInitialized = new(
+            id: "PBN0029",
+            title: nameof(DataContractAnalyzer) + "." + nameof(NullableMemberInitialized),
+            messageFormat: "'{0}' is nullable, but its initializer gives it a value; null is not written, so a null comes back as that value{1}. To fix: remove the initializer, or reset it to null in a [ProtoBeforeDeserialization] callback.",
+            category: Literals.CategoryUsage,
+            defaultSeverity: DiagnosticSeverity.Warning,
+            isEnabledByDefault: true,
+            helpLinkUri: "https://docs.protobuf-net.dev/rules/PBN0029");
+
+        internal static readonly DiagnosticDescriptor NonNullableMemberLeftNull = new(
+            id: "PBN0030",
+            title: nameof(DataContractAnalyzer) + "." + nameof(NonNullableMemberLeftNull),
+            messageFormat: "'{0}' is non-nullable, but {1}; it is null whenever the payload does not carry it, which for a member that is not serialized is every time. To fix: declare it nullable, or restore it in a deserialization callback.",
+            category: Literals.CategoryUsage,
+            defaultSeverity: DiagnosticSeverity.Warning,
+            isEnabledByDefault: true,
+            helpLinkUri: "https://docs.protobuf-net.dev/rules/PBN0030");
+
         internal static readonly DiagnosticDescriptor ProtoContractOnInterface = new(
             id: "PBN0023",
             title: nameof(DataContractAnalyzer) + "." + nameof(ProtoContractOnInterface),
@@ -667,9 +685,9 @@ internal static readonly DiagnosticDescriptor DeclaredAndIgnored = new(
                     ));
                 }
                 // not inside ReportProblems: that bails when no member is annotated, and a contract
-                // with no [ProtoMember] at all is where this is sharpest - the member is then never
-                // written, so it is null after *every* deserialize
-                typeContext.ReportCollectionsLeftNull(context, type);
+                // with no [ProtoMember] at all is where PBN0028/PBN0030 are sharpest - the member is
+                // then never written, so it is null after *every* deserialize
+                typeContext.ReportNullsOnDeserialize(context, type);
                 typeContext.ReportProblems(context, type);
             }
 
