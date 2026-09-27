@@ -68,7 +68,7 @@ namespace ProtoBuf.CodeFixes
                     context.RegisterCodeFix(CodeAction.Create(
                         title: $"Declare '{name}' nullable",
                         createChangedDocument: _ => Task.FromResult(context.Document.WithSyntaxRoot(
-                            DeclareNullable(root, declaration, type))),
+                            DeclareNullable(root, declaration, type, model, context.CancellationToken))),
                         equivalenceKey: NullableKey), diagnostic);
                 }
 
@@ -111,18 +111,21 @@ namespace ProtoBuf.CodeFixes
         // `T` becomes `T?`, and a `= null!` or `= default!` that only existed to silence CS8618 goes,
         // since it no longer silences anything - judged by the analyzer's own test, so that what is
         // removed is exactly what it did not count as an initializer
-        private static SyntaxNode DeclareNullable(SyntaxNode root, SyntaxNode declaration, TypeSyntax type)
+        private static SyntaxNode DeclareNullable(SyntaxNode root, SyntaxNode declaration, TypeSyntax type,
+            SemanticModel model, CancellationToken cancellationToken)
         {
             var nullable = SyntaxFactory.NullableType(type.WithoutTrivia()).WithTriviaFrom(type);
             switch (declaration)
             {
                 // a field's type belongs to the enclosing declaration, not to the declarator
                 case VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax variables } variable:
-                    var declarator = variable.Initializer is { } assigned && DataContractContext.IsSpelledOutNull(assigned.Value)
+                    var declarator = variable.Initializer is { } assigned
+                        && DataContractContext.IsSpelledOutNull(assigned.Value, model, cancellationToken)
                         ? WithoutInitializer(variable)
                         : variable;
                     return root.ReplaceNode(variables, variables.ReplaceNode(variable, declarator).WithType(nullable));
-                case PropertyDeclarationSyntax { Initializer.Value: var value } property when DataContractContext.IsSpelledOutNull(value):
+                case PropertyDeclarationSyntax { Initializer.Value: var value } property
+                    when DataContractContext.IsSpelledOutNull(value, model, cancellationToken):
                     return root.ReplaceNode(property, ((PropertyDeclarationSyntax)WithoutInitializer(property)).WithType(nullable));
                 default:
                     return root.ReplaceNode(type, nullable);
@@ -130,16 +133,26 @@ namespace ProtoBuf.CodeFixes
         }
 
         // `= value` goes - and, on a property, the `;` that only existed to end it - with the trailing
-        // trivia kept where it was. Shared with the PBN0029 fix, which is nothing but this
+        // trivia kept where it was, and a comment sitting before the `=` kept too; only the
+        // whitespace that separated it from the `=` goes. Shared with the PBN0029 fix
         internal static SyntaxNode WithoutInitializer(SyntaxNode declaration) => declaration switch
         {
             PropertyDeclarationSyntax { Initializer: not null, AccessorList: { } accessors } property
                 => property.WithInitializer(null).WithSemicolonToken(default)
-                    .WithAccessorList(accessors.WithTrailingTrivia(property.SemicolonToken.TrailingTrivia)),
+                    .WithAccessorList(accessors.WithTrailingTrivia(
+                        WithoutTrailingWhitespace(accessors.GetTrailingTrivia()).AddRange(property.SemicolonToken.TrailingTrivia))),
             VariableDeclaratorSyntax { Initializer: not null } variable
-                => variable.WithInitializer(null).WithIdentifier(variable.Identifier.WithoutTrivia()),
+                => variable.WithInitializer(null)
+                    .WithIdentifier(variable.Identifier.WithTrailingTrivia(WithoutTrailingWhitespace(variable.Identifier.TrailingTrivia))),
             _ => declaration,
         };
+
+        private static SyntaxTriviaList WithoutTrailingWhitespace(SyntaxTriviaList trivia)
+        {
+            int count = trivia.Count;
+            while (count > 0 && trivia[count - 1].Kind() is SyntaxKind.WhitespaceTrivia or SyntaxKind.EndOfLineTrivia) count--;
+            return SyntaxFactory.TriviaList(trivia.Take(count));
+        }
 
         // only what can be written without guessing: an empty one-dimensional array, or a class with
         // a public parameterless constructor. An interface or an immutable type would need a

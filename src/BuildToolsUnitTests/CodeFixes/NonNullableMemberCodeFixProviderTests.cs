@@ -54,6 +54,14 @@ using PM = ProtoBuf.ProtoMemberAttribute;
         [InlineData(
             "[ProtoContract(SkipConstructor = true)] public record Person([property: ProtoMember(1)] string {|PBN0030:Name|});",
             "[ProtoContract(SkipConstructor = true)] public record Person([property: ProtoMember(1)] string? Name);")]
+        // a comment before the `=` survives the `= null!` going
+        [InlineData(
+            "[ProtoContract] public class Foo { [ProtoMember(1)] public List<int> {|PBN0028:Items|} /* lines */ = null!; }",
+            "[ProtoContract] public class Foo { [ProtoMember(1)] public List<int>? Items /* lines */; }")]
+        // `(List<int>)null!` assigns nothing either
+        [InlineData(
+            "[ProtoContract] public class Foo { [ProtoMember(1)] public List<int> {|PBN0028:Items|} { get; set; } = (List<int>)null!; }",
+            "[ProtoContract] public class Foo { [ProtoMember(1)] public List<int>? Items { get; set; } }")]
         public Task DeclaresNullable(string source, string expected)
             => RunAsync(source, expected, NonNullableMemberCodeFixProvider.NullableKey);
 

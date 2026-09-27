@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Operations;
 using ProtoBuf.BuildTools.Analyzers;
 using ProtoBuf.Internal.Models;
 using System.Collections.Generic;
@@ -627,14 +628,26 @@ namespace ProtoBuf.BuildTools.Internal
             return false;
         }
 
-        // Not for a Nullable<T> either: that is written whenever it has a value, zero included, so
-        // IsRequired changes nothing on the wire (probed) - and alongside [NullWrappedValue] it makes
-        // protobuf-net refuse the model outright. What such a member can lose is null, and that is
-        // PBN0029's business, which IsRequired does not help with.
+        // Not for a nullable member either: a Nullable<T> is written whenever it has a value, zero
+        // included, and a reference whenever it is not null, so IsRequired changes nothing on the
+        // wire (probed) - and alongside [NullWrappedValue] it makes protobuf-net refuse the model
+        // outright. What such a member can lose is null, which IsRequired does not help with either
+        // (probed); that is PBN0029's business.
         /// <remarks>Ensure to validate member before (i.e. calculate default value of member)</remarks>
         private bool ShouldDeclareIsRequired(Member member)
-            => !member.IsRequired && !IsCollectionLike(member.MemberType)
-                && member.MemberType?.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T;
+            => !member.IsRequired && !IsCollectionLike(member.MemberType) && !IsNullableMember(member);
+
+        // Nullable<T>, or a reference the author annotated `?`; an oblivious one has promised nothing
+        private static bool IsNullableMember(Member member) => member.Symbol switch
+        {
+            IPropertySymbol property => IsNullable(property.Type, property.NullableAnnotation),
+            IFieldSymbol field => IsNullable(field.Type, field.NullableAnnotation),
+            _ => false,
+        };
+
+        private static bool IsNullable(ITypeSymbol type, NullableAnnotation annotation)
+            => type.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T
+                || (type.IsReferenceType && annotation == NullableAnnotation.Annotated);
 
         // A collection member is exempt from the IsRequired nag: an empty collection has no wire
         // presence to force (repeated fields write per element), initializing to an empty collection
@@ -887,7 +900,8 @@ namespace ProtoBuf.BuildTools.Internal
         // - PBN0029, the mirror image: a *nullable* member that an initializer makes non-null. Null
         //   is not written, so the receiver keeps the initializer's value, and with [NullWrappedValue]
         //   a zero or false goes the same way, since the wrapper is written empty. Only where the
-        //   initializer runs, and only for a member that is written at all.
+        //   initializer runs on some path, and only for a [ProtoMember] - conservative, since
+        //   ImplicitFields and [DataMember] write one too.
         internal void ReportNullsOnDeserialize(SyntaxNodeAnalysisContext context, INamedTypeSymbol type)
         {
             // with a surrogate protobuf-net constructs the surrogate and converts, and with a
@@ -905,13 +919,21 @@ namespace ProtoBuf.BuildTools.Internal
             // belongs to the concrete type actually read, never to its bases (probed): it is inert
             // on an abstract type, and a sub-type that sets it leaves the members it inherits from
             // here as bare as its own - so the sub-types count as much as this type does
+            bool skipsItself = HasFlag(DataContractContextFlags.SkipConstructor) && !type.IsAbstract;
+            var (skippingSubType, constructedSubType) = type.IsValueType ? (null, false) : WalkSubTypes(type);
             string? notConstructed = type.IsValueType
                 ? "a struct contract is never constructed on deserialize, so no constructor or initializer runs"
-                : HasFlag(DataContractContextFlags.SkipConstructor) && !type.IsAbstract
+                : skipsItself
                 ? "SkipConstructor means no constructor or initializer runs on deserialize"
-                : FindSubTypeSkippingConstructor(type) is { } subType
-                ? $"SkipConstructor on the sub-type '{subType.Name}' means no constructor or initializer runs when one is deserialized"
+                : skippingSubType is not null
+                ? $"SkipConstructor on the sub-type '{skippingSubType.Name}' means no constructor or initializer runs when one is deserialized"
                 : null;
+
+            // ...and whether an initializer runs on *some* path: this type constructed as usual, a
+            // sub-type that is, or an abstract type whose sub-types are not all visible - which a
+            // nullable member's initializer needs in order to turn a null into its value
+            bool initializerRuns = !type.IsValueType
+                && (constructedSubType || (type.IsAbstract ? skippingSubType is null : !skipsItself));
 
             HashSet<string>? assignedByConstructor = null;
             bool constructorsUnanswerable = false;
@@ -953,14 +975,16 @@ namespace ProtoBuf.BuildTools.Internal
                 if (nullableValue || annotation == NullableAnnotation.Annotated)
                 {
                     // PBN0029: only where the initializer runs, on a member that is written, and
-                    // where nothing else is managing presence - a {Name}Specified or
-                    // ShouldSerialize{Name} lets the receiver tell "absent" apart already
-                    if (notConstructed is not null || !HasProtoMember(member)
-                        || !HasNonNullInitializer(member, context.CancellationToken)
-                        || HasSpecifiedProperty(type, member.Name) || HasShouldSerializeMethod(type, member.Name)) continue;
+                    // where nothing else is managing presence. {Name}Specified does - it is assigned
+                    // on read, so it comes back false - but ShouldSerialize{Name} only decides the
+                    // write, and leaves the receiver as blind as before (both probed)
+                    if (!initializerRuns || !HasProtoMember(member)
+                        || !HasNonNullInitializer(member, context.SemanticModel, context.CancellationToken)
+                        || HasSpecifiedProperty(type, member.Name)) continue;
                     restored ??= AssignedInDeserializationCallbacks(type, context.CancellationToken);
                     if (restored.Contains(member.Name)) continue;
 
+                    bool declaredDefault = HasDeclaredDefault(member);
                     context.ReportDiagnostic(Diagnostic.Create(
                         descriptor: DataContractAnalyzer.NullableMemberInitialized,
                         location: location,
@@ -970,9 +994,12 @@ namespace ProtoBuf.BuildTools.Internal
                             nullableValue && IsNullWrappedValue(member) && WrapsZeroAsEmpty(((INamedTypeSymbol)memberType).TypeArguments[0])
                                 ? ", as does a zero or false, which [NullWrappedValue] writes as an empty wrapper"
                                 : "",
+                            DescribeNullableFixes(declaredDefault, IsAssignableAfterConstruction(member)),
                         },
                         additionalLocations: null,
-                        properties: null
+                        properties: declaredDefault
+                            ? DiagnosticPropertiesBuilder.Create().Add(NullableMemberDeclaredDefaultKey, "true").Build()
+                            : null
                     ));
                     continue;
                 }
@@ -987,7 +1014,12 @@ namespace ProtoBuf.BuildTools.Internal
                     context.ReportDiagnostic(Diagnostic.Create(
                         descriptor: DataContractAnalyzer.NonNullableMemberLeftNull,
                         location: location,
-                        messageArgs: new object[] { member.Name, notConstructed },
+                        messageArgs: new object[]
+                        {
+                            member.Name,
+                            notConstructed,
+                            DescribeFixes(constructed: false, hasProtoMember: false, IsAssignableAfterConstruction(member)),
+                        },
                         additionalLocations: null,
                         // the same code fix serves it, and "not constructed" is what rules out
                         // every remedy but declaring it nullable
@@ -1002,7 +1034,7 @@ namespace ProtoBuf.BuildTools.Internal
 
                 if (notConstructed is null)
                 {
-                    if (HasNonNullInitializer(member, context.CancellationToken)) continue;
+                    if (HasNonNullInitializer(member, context.SemanticModel, context.CancellationToken)) continue;
                     // worked out once, and only for a type that has a candidate; a type with no
                     // answer - a `: this(...)` chain, or no constructor to call - reports no
                     // collection that would rest on it
@@ -1029,7 +1061,7 @@ namespace ProtoBuf.BuildTools.Internal
                     {
                         member.Name,
                         notConstructed ?? "nothing assigns it when protobuf-net constructs the instance",
-                        DescribeCollectionFixes(constructed, hasProtoMember, IsAssignableAfterConstruction(member)),
+                        DescribeFixes(constructed, hasProtoMember, IsAssignableAfterConstruction(member)),
                     },
                     additionalLocations: null,
                     properties: DiagnosticPropertiesBuilder.Create()
@@ -1046,7 +1078,7 @@ namespace ProtoBuf.BuildTools.Internal
         internal const string CollectionLeftNullConstructedKey = "Constructed";
         internal const string CollectionLeftNullHasProtoMemberKey = "HasProtoMember";
 
-        private static string DescribeCollectionFixes(bool constructed, bool hasProtoMember, bool assignable)
+        private static string DescribeFixes(bool constructed, bool hasProtoMember, bool assignable)
         {
             var fixes = new List<string> { "declare it nullable" };
             if (constructed) fixes.Add("initialize it");
@@ -1066,26 +1098,65 @@ namespace ProtoBuf.BuildTools.Internal
             _ => false,
         };
 
-        // The first concrete type below this one, through [ProtoInclude], whose own SkipConstructor
-        // means it is read without being constructed. Only [ProtoInclude] is visible here: a sub-type
-        // added at run time with AddSubType is not, and is missed.
-        private static INamedTypeSymbol? FindSubTypeSkippingConstructor(INamedTypeSymbol type)
+        // PBN0029's remedies. A declared default stops its own value being written, so it has to go
+        // too: without the initializer, or reset to null, the receiver would get null for it instead
+        internal const string NullableMemberDeclaredDefaultKey = "DeclaredDefault";
+
+        private static string DescribeNullableFixes(bool declaredDefault, bool assignable)
         {
+            var remove = declaredDefault ? "remove the initializer and the [DefaultValue]" : "remove the initializer";
+            if (!assignable) return remove;
+            return remove + ", or " + (declaredDefault ? "remove the [DefaultValue] and " : "")
+                + "reset it to null in a [ProtoBeforeDeserialization] callback";
+        }
+
+        // a [DefaultValue] that declares anything: null means "no declared default" (see
+        // HasEffectiveDeclaredDefault), but on a nullable member even a zero is a value that is then
+        // not written, so that is all that is ruled out here
+        private static bool HasDeclaredDefault(ISymbol member)
+        {
+            foreach (var attrib in member.GetAttributes())
+            {
+                if (attrib.AttributeClass is not { Name: nameof(DefaultValueAttribute) } ac
+                    || !ac.InNamespace(nameof(System), nameof(System.ComponentModel))) continue;
+                var args = attrib.ConstructorArguments;
+                return args.Length switch
+                {
+                    1 => !args[0].IsNull,
+                    2 => !args[1].IsNull,
+                    _ => false,
+                };
+            }
+            return false;
+        }
+
+        // The concrete types below this one, through [ProtoInclude] at any depth: the first whose own
+        // SkipConstructor means it is read without being constructed, and whether any is constructed
+        // as usual. Only [ProtoInclude] is visible here: a sub-type added at run time with AddSubType
+        // is not, and is missed.
+        private static (INamedTypeSymbol? Skipping, bool AnyConstructed) WalkSubTypes(INamedTypeSymbol type)
+        {
+            INamedTypeSymbol? skipping = null;
+            bool anyConstructed = false;
             var seen = new HashSet<ISymbol>(SymbolEqualityComparer.Default) { type };
             var pending = new Stack<INamedTypeSymbol>();
             pending.Push(type);
-            while (pending.Count != 0)
+            while (pending.Count != 0 && (skipping is null || !anyConstructed))
             {
                 foreach (var attrib in pending.Pop().GetAttributes())
                 {
                     if (attrib.AttributeClass is not { Name: nameof(ProtoIncludeAttribute) } ac || !ac.InProtoBufNamespace()
                         || !attrib.TryGetTypeByName(nameof(ProtoIncludeAttribute.KnownType), out var known)
                         || known is not INamedTypeSymbol subType || !seen.Add(subType)) continue;
-                    if (!subType.IsAbstract && SkipsConstructor(subType)) return subType;
+                    if (!subType.IsAbstract)
+                    {
+                        if (SkipsConstructor(subType)) skipping ??= subType;
+                        else anyConstructed = true;
+                    }
                     pending.Push(subType);
                 }
             }
-            return null;
+            return (skipping, anyConstructed);
 
             static bool SkipsConstructor(INamedTypeSymbol type)
             {
@@ -1130,7 +1201,7 @@ namespace ProtoBuf.BuildTools.Internal
         }
 
         // an initializer runs as part of every constructor, so anything but a spelled-out null counts
-        private static bool HasNonNullInitializer(ISymbol member, CancellationToken cancellationToken)
+        private static bool HasNonNullInitializer(ISymbol member, SemanticModel model, CancellationToken cancellationToken)
         {
             foreach (var reference in member.DeclaringSyntaxReferences)
             {
@@ -1140,25 +1211,47 @@ namespace ProtoBuf.BuildTools.Internal
                     VariableDeclaratorSyntax variable => variable.Initializer?.Value,
                     _ => null,
                 };
-                if (value is not null && !IsSpelledOutNull(value)) return true;
+                if (value is not null && !IsSpelledOutNull(value, model, cancellationToken)) return true;
             }
             return false;
         }
 
-        // `null`, `default` or `default(T)`, with or without `!`: how CS8618 is routinely silenced on
-        // a DTO, and it assigns nothing. Shared with the code fix, which removes exactly what this
-        // treats as no initializer - were the two to drift, it would leave one behind or take a real
-        // one away
-        internal static bool IsSpelledOutNull(ExpressionSyntax value)
+        // `null`, `default` or `default(T)`, with or without `!` or a cast: how CS8618 is routinely
+        // silenced on a DTO, and it assigns nothing. Asked of the semantic model rather than read off
+        // the syntax, since on a Nullable<T> `default(int)` is a zero and `(int?)null` is a null.
+        // Shared with the code fix, which removes exactly what this treats as no initializer - were
+        // the two to drift, it would leave one behind or take a real one away
+        internal static bool IsSpelledOutNull(ExpressionSyntax value, SemanticModel model, CancellationToken cancellationToken)
         {
-            while (value is PostfixUnaryExpressionSyntax postfix
-                && postfix.IsKind(SyntaxKind.SuppressNullableWarningExpression))
+            while (true)
             {
-                value = postfix.Operand;
+                switch (value)
+                {
+                    case PostfixUnaryExpressionSyntax postfix when postfix.IsKind(SyntaxKind.SuppressNullableWarningExpression):
+                        value = postfix.Operand;
+                        continue;
+                    case ParenthesizedExpressionSyntax parenthesized:
+                        value = parenthesized.Expression;
+                        continue;
+                }
+                break;
             }
-            return value is DefaultExpressionSyntax
-                || value.IsKind(SyntaxKind.NullLiteralExpression)
-                || value.IsKind(SyntaxKind.DefaultLiteralExpression);
+            return value.SyntaxTree == model.SyntaxTree
+                && model.GetOperation(value, cancellationToken) is { } operation
+                && IsNull(operation);
+
+            // a conversion to a non-nullable value type yields a value whatever it converts, and a
+            // default is null exactly when its type can be
+            static bool IsNull(IOperation operation) => operation switch
+            {
+                IConversionOperation conversion => CanBeNull(conversion.Type) && IsNull(conversion.Operand),
+                IDefaultValueOperation @default => CanBeNull(@default.Type),
+                _ => operation.ConstantValue is { HasValue: true, Value: null },
+            };
+
+            static bool CanBeNull(ITypeSymbol? type) => type is null || type.IsReferenceType
+                || type.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T
+                || type is ITypeParameterSymbol { IsValueType: false };
         }
 
         // an enumerable [ProtoContract(IgnoreListHandling = true)] type is a message rather than a
@@ -1191,8 +1284,9 @@ namespace ProtoBuf.BuildTools.Internal
 
         // inside a [NullWrappedValue] wrapper the value is an ordinary field at 1, so a zero or false
         // is left out and the wrapper goes out empty - and an empty wrapper, read into an existing
-        // value, leaves it alone (probed for bool, char, byte, int, uint, long, float and double). Not
-        // so for an enum, whose zero is written explicitly, nor a string, which is written even empty
+        // value, leaves it alone (probed for bool, char, byte, short, int, uint, long, ulong, nint,
+        // float and double). Not so for an enum, whose zero is written explicitly, nor a string,
+        // which is written even empty
         private static bool WrapsZeroAsEmpty(ITypeSymbol valueType) => valueType.SpecialType switch
         {
             SpecialType.System_Boolean or SpecialType.System_Char
@@ -1200,6 +1294,7 @@ namespace ProtoBuf.BuildTools.Internal
             or SpecialType.System_Int16 or SpecialType.System_UInt16
             or SpecialType.System_Int32 or SpecialType.System_UInt32
             or SpecialType.System_Int64 or SpecialType.System_UInt64
+            or SpecialType.System_IntPtr or SpecialType.System_UIntPtr
             or SpecialType.System_Single or SpecialType.System_Double => true,
             _ => false,
         };
@@ -1353,6 +1448,14 @@ namespace ProtoBuf.BuildTools.Internal
             }
 
             if (member.IsRequired)
+            {
+                return false;
+            }
+
+            // a nullable member's initializer is written whenever it is set, and what it can lose is
+            // null - which PBN0029 reports. A declared default would stop that value being written,
+            // so a receiver that resets the member to null, as PBN0029 suggests, would lose it
+            if (IsNullableMember(member))
             {
                 return false;
             }

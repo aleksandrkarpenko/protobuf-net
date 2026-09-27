@@ -246,7 +246,7 @@ internal static readonly DiagnosticDescriptor DeclaredAndIgnored = new(
         internal static readonly DiagnosticDescriptor NullableMemberInitialized = new(
             id: "PBN0029",
             title: nameof(DataContractAnalyzer) + "." + nameof(NullableMemberInitialized),
-            messageFormat: "'{0}' is nullable, but its initializer gives it a value; null is not written, so a null comes back as that value{1}. To fix: remove the initializer, or reset it to null in a [ProtoBeforeDeserialization] callback.",
+            messageFormat: "'{0}' is nullable, but its initializer gives it a value; null is not written, so a null comes back as that value{1}. To fix: {2}.",
             category: Literals.CategoryUsage,
             defaultSeverity: DiagnosticSeverity.Warning,
             isEnabledByDefault: true,
@@ -255,7 +255,7 @@ internal static readonly DiagnosticDescriptor DeclaredAndIgnored = new(
         internal static readonly DiagnosticDescriptor NonNullableMemberLeftNull = new(
             id: "PBN0030",
             title: nameof(DataContractAnalyzer) + "." + nameof(NonNullableMemberLeftNull),
-            messageFormat: "'{0}' is non-nullable, but {1}; it is null whenever the payload does not carry it, which for a member that is not serialized is every time. To fix: declare it nullable, or restore it in a deserialization callback.",
+            messageFormat: "'{0}' is non-nullable, but {1}; it is null whenever the payload does not carry it, which for a member that is not serialized is every time. To fix: {2}.",
             category: Literals.CategoryUsage,
             defaultSeverity: DiagnosticSeverity.Warning,
             isEnabledByDefault: true,
