@@ -850,7 +850,8 @@ namespace ProtoBuf.BuildTools.Internal
         //
         // - SkipConstructor builds the instance with GetUninitializedObject, so no constructor runs
         //   and nor does any initializer, since those are compiled into the constructor: `= new()`,
-        //   `{ get; } = new()` and a positional record parameter all come back null;
+        //   `{ get; } = new()` and a positional record parameter all come back null. It is the
+        //   concrete type's setting that counts, so a sub-type with it strips its bases as well;
         // - a struct contract is never constructed at all - TypeSerializer reads into `default` - so
         //   the same holds for it, explicit parameterless constructor or not;
         // - otherwise, nothing assigns it: no initializer - or only `= null!`, the routine way of
@@ -870,15 +871,20 @@ namespace ProtoBuf.BuildTools.Internal
                 || HasFlag(DataContractContextFlags.HasSerializer)
                 || type.TypeKind == TypeKind.Interface) return;
 
+            // a type protobuf-net treats as a collection is serialized as that collection, and its
+            // members are ignored altogether (probed) - nothing here is ever read
+            if (IsRepeatedLike(type) && !HasFlag(DataContractContextFlags.IgnoreListHandling)) return;
+
             // null when the type is constructed normally, otherwise why it is not. SkipConstructor
-            // belongs to the type actually constructed, so it is inert on an abstract type - the
-            // concrete type runs this constructor like any other base (probed both ways) - and on a
-            // type protobuf-net treats as a collection, which it activates rather than reads into
+            // belongs to the concrete type actually read, never to its bases (probed): it is inert
+            // on an abstract type, and a sub-type that sets it leaves the members it inherits from
+            // here as bare as its own - so the sub-types count as much as this type does
             string? notConstructed = type.IsValueType
                 ? "a struct contract is never constructed on deserialize, so no constructor or initializer runs"
                 : HasFlag(DataContractContextFlags.SkipConstructor) && !type.IsAbstract
-                    && !(IsRepeatedLike(type) && !HasFlag(DataContractContextFlags.IgnoreListHandling))
                 ? "SkipConstructor means no constructor or initializer runs on deserialize"
+                : FindSubTypeSkippingConstructor(type) is { } subType
+                ? $"SkipConstructor on the sub-type '{subType.Name}' means no constructor or initializer runs when one is deserialized"
                 : null;
 
             HashSet<string>? assignedByConstructor = null;
@@ -944,7 +950,7 @@ namespace ProtoBuf.BuildTools.Internal
                     {
                         member.Name,
                         notConstructed ?? "nothing assigns it when protobuf-net constructs the instance",
-                        DescribeCollectionFixes(constructed, hasProtoMember),
+                        DescribeCollectionFixes(constructed, hasProtoMember, IsAssignableAfterConstruction(member)),
                     },
                     additionalLocations: null,
                     properties: DiagnosticPropertiesBuilder.Create()
@@ -957,17 +963,62 @@ namespace ProtoBuf.BuildTools.Internal
 
         // which remedies apply, for the message and for the code fix: an initializer only helps when
         // a constructor runs, null-wrapping only when the member is written, and a callback is the
-        // one thing that works when nothing is constructed
+        // one thing that works when nothing is constructed - provided the callback may assign it
         internal const string CollectionLeftNullConstructedKey = "Constructed";
         internal const string CollectionLeftNullHasProtoMemberKey = "HasProtoMember";
 
-        private static string DescribeCollectionFixes(bool constructed, bool hasProtoMember)
+        private static string DescribeCollectionFixes(bool constructed, bool hasProtoMember, bool assignable)
         {
             var fixes = new List<string> { "declare it nullable" };
             if (constructed) fixes.Add("initialize it");
             if (hasProtoMember) fixes.Add("mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format)");
-            if (!constructed) fixes.Add("restore it in a deserialization callback");
-            return string.Join(", ", fixes.Take(fixes.Count - 1)) + ", or " + fixes[fixes.Count - 1];
+            if (!constructed && assignable) fixes.Add("restore it in a deserialization callback");
+            return fixes.Count == 1 ? fixes[0]
+                : string.Join(", ", fixes.Take(fixes.Count - 1)) + ", or " + fixes[fixes.Count - 1];
+        }
+
+        // whether an ordinary method - which a callback is - may assign the member: not a readonly
+        // field (CS0191), a getter-only property (CS0200), nor an init-only one (CS8852), which is
+        // what a positional record's parameter becomes
+        private static bool IsAssignableAfterConstruction(ISymbol member) => member switch
+        {
+            IFieldSymbol field => !field.IsReadOnly,
+            IPropertySymbol property => property.SetMethod is { IsInitOnly: false },
+            _ => false,
+        };
+
+        // The first concrete type below this one, through [ProtoInclude], whose own SkipConstructor
+        // means it is read without being constructed. Only [ProtoInclude] is visible here: a sub-type
+        // added at run time with AddSubType is not, and is missed.
+        private static INamedTypeSymbol? FindSubTypeSkippingConstructor(INamedTypeSymbol type)
+        {
+            var seen = new HashSet<ISymbol>(SymbolEqualityComparer.Default) { type };
+            var pending = new Stack<INamedTypeSymbol>();
+            pending.Push(type);
+            while (pending.Count != 0)
+            {
+                foreach (var attrib in pending.Pop().GetAttributes())
+                {
+                    if (attrib.AttributeClass is not { Name: nameof(ProtoIncludeAttribute) } ac || !ac.InProtoBufNamespace()
+                        || !attrib.TryGetTypeByName(nameof(ProtoIncludeAttribute.KnownType), out var known)
+                        || known is not INamedTypeSymbol subType || !seen.Add(subType)) continue;
+                    if (!subType.IsAbstract && SkipsConstructor(subType)) return subType;
+                    pending.Push(subType);
+                }
+            }
+            return null;
+
+            static bool SkipsConstructor(INamedTypeSymbol type)
+            {
+                foreach (var attrib in type.GetAttributes())
+                {
+                    if (attrib.AttributeClass is { Name: nameof(ProtoContractAttribute) } ac && ac.InProtoBufNamespace())
+                    {
+                        return attrib.TryGetBooleanByName(nameof(ProtoContractAttribute.SkipConstructor), out var skip) && skip;
+                    }
+                }
+                return false;
+            }
         }
 
         // The names assigned by whichever constructors can run when protobuf-net creates the type:

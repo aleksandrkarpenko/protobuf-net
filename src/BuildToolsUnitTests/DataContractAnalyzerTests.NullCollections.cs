@@ -41,7 +41,8 @@ public record TestRecord([property: ProtoMember(1)] string[] Array);
             Assert.Equal(DiagnosticSeverity.Warning, diag.Severity);
             var message = diag.GetMessage(CultureInfo.InvariantCulture);
             Assert.StartsWith("'Array' is a non-nullable collection, but SkipConstructor means no constructor or initializer runs on deserialize;", message);
-            Assert.EndsWith("To fix: declare it nullable, mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format), or restore it in a deserialization callback.", message);
+            // a positional record's property is init-only, so a callback cannot assign it and is not offered
+            Assert.EndsWith("To fix: declare it nullable, or mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format).", message);
 
             var span = diag.Location.SourceSpan;
             var text = (await diag.Location.SourceTree!.GetTextAsync()).ToString().Substring(span.Start, span.Length);
@@ -227,6 +228,15 @@ public class Foo {{
             "declare it nullable, mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format), or restore it in a deserialization callback")]
         [InlineData("[ProtoContract(SkipConstructor = true)]", "public List<int> Items { get; set; } = new();",
             "declare it nullable, or restore it in a deserialization callback")]
+        // ...and a callback only where it may assign the member: not getter-only, init-only or readonly
+        [InlineData("[ProtoContract(SkipConstructor = true)]", "[ProtoMember(1)] public List<int> Items { get; } = new();",
+            "declare it nullable, or mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format)")]
+        [InlineData("[ProtoContract(SkipConstructor = true)]", "[ProtoMember(1)] public List<int> Items { get; init; } = new();",
+            "declare it nullable, or mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format)")]
+        [InlineData("[ProtoContract(SkipConstructor = true)]", "private readonly List<int> Items = new();",
+            "declare it nullable")]
+        [InlineData("[ProtoContract(SkipConstructor = true)]", "[ProtoMember(1)] public List<int> Items { get; private set; } = new();",
+            "declare it nullable, mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format), or restore it in a deserialization callback")]
         public async Task SuggestsOnlyFixesThatWork(string contract, string body, string fixes)
         {
             var diags = await NullCollectionDiagnosticsAsync($@"
@@ -262,6 +272,75 @@ public class Derived : Base { }");
 
             var diag = Assert.Single(diags);
             Assert.Contains("'Items'", diag.GetMessage(CultureInfo.InvariantCulture));
+        }
+
+        // SkipConstructor belongs to the concrete type being read, so a sub-type that sets it leaves
+        // the members it inherits unconstructed as well, whatever the base says (probed)
+        [Theory]
+        [InlineData("[ProtoContract]", "class")]
+        // an abstract base's own SkipConstructor is inert; the sub-type's is not
+        [InlineData("[ProtoContract(SkipConstructor = true)]", "abstract class")]
+        public async Task ReportsBaseMemberWhenASubTypeSkipsConstructor(string contract, string kind)
+        {
+            var diags = await NullCollectionDiagnosticsAsync($@"
+#nullable enable
+using ProtoBuf;
+using System.Collections.Generic;
+{contract}
+[ProtoInclude(10, typeof(Derived))]
+public {kind} Base {{
+    [ProtoMember(1)] public List<int> Items {{ get; set; }} = new();
+}}
+[ProtoContract(SkipConstructor = true)]
+public class Derived : Base {{ }}");
+
+            var diag = Assert.Single(diags);
+            Assert.StartsWith("'Items' is a non-nullable collection, but SkipConstructor on the sub-type 'Derived' means no constructor or initializer runs when one is deserialized;", diag.GetMessage(CultureInfo.InvariantCulture));
+            Assert.Equal("false", diag.Properties["Constructed"]);
+        }
+
+        // ...at any depth, and whichever level sets it, so long as that level is concrete (probed)
+        [Theory]
+        [InlineData("[ProtoContract]", "class", "[ProtoContract(SkipConstructor = true)]", "Leaf")]
+        [InlineData("[ProtoContract(SkipConstructor = true)]", "class", "[ProtoContract]", "Middle")]
+        [InlineData("[ProtoContract(SkipConstructor = true)]", "abstract class", "[ProtoContract(SkipConstructor = true)]", "Leaf")]
+        public async Task ReportsBaseMemberWhenADeeperSubTypeSkipsConstructor(string middleContract, string middleKind, string leafContract, string skipping)
+        {
+            var diags = await NullCollectionDiagnosticsAsync($@"
+#nullable enable
+using ProtoBuf;
+using System.Collections.Generic;
+[ProtoContract, ProtoInclude(10, typeof(Middle))]
+public class Base {{
+    [ProtoMember(1)] public List<int> Items {{ get; set; }} = new();
+}}
+{middleContract}
+[ProtoInclude(10, typeof(Leaf))]
+public {middleKind} Middle : Base {{ }}
+{leafContract}
+public class Leaf : Middle {{ }}");
+
+            var diag = Assert.Single(diags);
+            Assert.Contains($"but SkipConstructor on the sub-type '{skipping}' means", diag.GetMessage(CultureInfo.InvariantCulture));
+        }
+
+        // the mirror image: SkipConstructor on the abstract base alone is inert, since the concrete
+        // sub-type runs the base constructor as usual - and so the initializer (probed)
+        [Fact]
+        public async Task DoesNotReportWhenOnlyAnAbstractBaseSkipsConstructor()
+        {
+            var diags = await NullCollectionDiagnosticsAsync(@"
+#nullable enable
+using ProtoBuf;
+using System.Collections.Generic;
+[ProtoContract(SkipConstructor = true), ProtoInclude(10, typeof(Derived))]
+public abstract class Base {
+    [ProtoMember(1)] public List<int> Items { get; set; } = new();
+}
+[ProtoContract]
+public class Derived : Base { }");
+
+            Assert.Empty(diags);
         }
 
         [Theory]
@@ -311,9 +390,10 @@ public class Derived : Base { }");
         [InlineData("#nullable enable", "[ProtoContract]", "[ProtoMember(1), NullWrappedCollection(AsGroup = true)] public int[] Items = null!;")]
         // an enumerable message is written even when empty, so it is no collection here
         [InlineData("#nullable enable", "[ProtoContract(SkipConstructor = true)]", "[ProtoMember(1)] public PathMessage Path { get; set; } = new();")]
-        // a type protobuf-net treats as a collection is activated with its constructor, so
-        // SkipConstructor has no effect on it
+        // a type protobuf-net treats as a collection is serialized as one, and its members are
+        // never read at all (probed) - SkipConstructor or not
         [InlineData("#nullable enable", "[ProtoContract(SkipConstructor = true)]", "public List<string> Tags { get; } = new();", "class", " : List<int>")]
+        [InlineData("#nullable enable", "[ProtoContract]", "[ProtoMember(1)] public List<string> Tags { get; set; } = null!;", "class", " : List<int>")]
         // assignments the compiler itself accepts as initializing: a [MemberNotNull] helper or
         // setter, and a tuple deconstruction
         [InlineData("#nullable enable", "[ProtoContract]", @"[ProtoMember(1)] public List<int> Items { get; set; }
