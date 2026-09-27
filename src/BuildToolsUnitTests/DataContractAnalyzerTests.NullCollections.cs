@@ -8,7 +8,7 @@ using Xunit;
 
 namespace BuildToolsUnitTests
 {
-    // PBN0027: an empty collection is normally not written at all, so on read the member keeps
+    // PBN0028: an empty collection is normally not written at all, so on read the member keeps
     // whatever construction left there - and for a non-nullable collection that nothing initializes,
     // that is a null the compiler believes cannot happen. Every "reported" shape below was probed
     // against RuntimeTypeModel and comes back null from an empty collection; every "not reported"

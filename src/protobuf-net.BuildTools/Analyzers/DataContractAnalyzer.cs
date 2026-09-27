@@ -235,13 +235,13 @@ internal static readonly DiagnosticDescriptor DeclaredAndIgnored = new(
             helpLinkUri: "https://stackoverflow.com/a/3162253/1882616");
 
         internal static readonly DiagnosticDescriptor NonNullableCollectionLeftNull = new(
-            id: "PBN0027",
+            id: "PBN0028",
             title: nameof(DataContractAnalyzer) + "." + nameof(NonNullableCollectionLeftNull),
             messageFormat: "'{0}' is a non-nullable collection, but {1}; it is null whenever the payload does not carry it, and an empty collection is normally not written at all. To fix: {2}.",
             category: Literals.CategoryUsage,
             defaultSeverity: DiagnosticSeverity.Warning,
             isEnabledByDefault: true,
-            helpLinkUri: "https://docs.protobuf-net.dev/rules/PBN0027");
+            helpLinkUri: "https://docs.protobuf-net.dev/rules/PBN0028");
 
         internal static readonly DiagnosticDescriptor ProtoContractOnInterface = new(
             id: "PBN0023",

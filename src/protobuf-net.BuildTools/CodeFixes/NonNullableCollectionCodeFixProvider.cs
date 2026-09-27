@@ -17,7 +17,7 @@ using System.Threading.Tasks;
 namespace ProtoBuf.CodeFixes
 {
     /// <summary>
-    /// Offers the remedies for PBN0027, a non-nullable collection that nothing initializes on
+    /// Offers the remedies for PBN0028, a non-nullable collection that nothing initializes on
     /// deserialize: declare it nullable, initialize it, or mark it <c>[NullWrappedCollection]</c>.
     /// </summary>
     /// <remarks>
@@ -31,7 +31,7 @@ namespace ProtoBuf.CodeFixes
     [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(NonNullableCollectionCodeFixProvider)), Shared]
     public class NonNullableCollectionCodeFixProvider : CodeFixProvider
     {
-        internal const string NullableKey = "PBN0027.Nullable", InitializeKey = "PBN0027.Initialize", NullWrapKey = "PBN0027.NullWrap";
+        internal const string NullableKey = "PBN0028.Nullable", InitializeKey = "PBN0028.Initialize", NullWrapKey = "PBN0028.NullWrap";
 
         /// <inheritdoc/>
         public override ImmutableArray<string> FixableDiagnosticIds => ImmutableArray.Create(DataContractAnalyzer.NonNullableCollectionLeftNull.Id);
