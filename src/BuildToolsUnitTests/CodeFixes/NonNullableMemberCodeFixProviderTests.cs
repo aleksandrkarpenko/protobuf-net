@@ -2,6 +2,7 @@ using BuildToolsUnitTests.CodeFixes.Abstractions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Testing;
 using ProtoBuf.BuildTools.Analyzers;
@@ -82,6 +83,16 @@ using PM = ProtoBuf.ProtoMemberAttribute;
         public Task Initializes(string source, string expected)
             => RunAsync(source, expected, NonNullableMemberCodeFixProvider.InitializeKey);
 
+        // before C# 9 there is no target-typed `new()`, so the type is spelled out
+        [Fact]
+        public Task InitializesWithTheTypeNamedBeforeCSharp9()
+            => RunCodeFixTestAsync<DataContractAnalyzer>(
+                Wrap("[ProtoContract] public class Foo { [ProtoMember(1)] public List<int> {|PBN0028:Items|} { get; set; } = null!; }"),
+                Wrap("[ProtoContract] public class Foo { [ProtoMember(1)] public List<int> Items { get; set; } = new List<int>(); }"),
+                codeActionEquivalenceKey: NonNullableMemberCodeFixProvider.InitializeKey,
+                languageVersion: LanguageVersion.CSharp8,
+                standardExpectedDiagnostics: _standardExpectedDiagnostics);
+
         [Theory]
         [InlineData(
             "[ProtoContract(SkipConstructor = true)] public class Foo { [ProtoMember(1)] public List<int> {|PBN0028:Items|} { get; set; } = new(); }",
@@ -111,7 +122,7 @@ using PM = ProtoBuf.ProtoMemberAttribute;
             "NonNullableMember.DeclareNullable", "NonNullableMember.NullWrapCollection")]
         [InlineData("[ProtoContract(SkipConstructor = true)] public record TestRecord([property: ProtoMember(1)] string[] Array);",
             "NonNullableMember.DeclareNullable", "NonNullableMember.NullWrapCollection")]
-        [InlineData("[ProtoContract] public class Foo { public List<int> Items { get; set; } = null!; }",
+        [InlineData("[ProtoContract] public class Foo { [System.Runtime.Serialization.DataMember(Order = 1)] public List<int> Items { get; set; } = null!; }",
             "NonNullableMember.DeclareNullable", "NonNullableMember.Initialize")]
         [InlineData("[ProtoContract] public class Foo { [ProtoMember(1)] public IList<int> Items { get; set; } = null!; }",
             "NonNullableMember.DeclareNullable", "NonNullableMember.NullWrapCollection")]
@@ -119,7 +130,7 @@ using PM = ProtoBuf.ProtoMemberAttribute;
         [InlineData("[ProtoContract(SkipConstructor = true)] public class Foo { [ProtoMember(1)] public string Name { get; set; } }",
             "NonNullableMember.DeclareNullable")]
         // `List<int>?` would change A as well as B, so only the initializer is offered
-        [InlineData("[ProtoContract] public class Foo { public List<int> A = new(), B; }",
+        [InlineData("[ProtoContract] public class Foo { [System.Runtime.Serialization.DataMember(Order = 1)] public List<int> A = new(), B; }",
             "NonNullableMember.Initialize")]
         public async Task OffersOnlyWhatWorks(string source, params string[] expected)
         {

@@ -17,7 +17,8 @@ namespace BuildToolsUnitTests
 public enum Color { Red, Green, Blue }
 [ProtoContract] public class Msg { [ProtoMember(1)] public int X { get; set; } }
 public class FooSerializer { }
-public struct Money { public static implicit operator Money(string? text) => default; }";
+public struct Money { public static implicit operator Money(string? text) => default; }
+[ProtoContract] public class Bag : System.Collections.IEnumerable { public System.Collections.IEnumerator GetEnumerator() => null!; }";
 
         private async Task<List<Diagnostic>> DiagnosticsAsync(DiagnosticDescriptor descriptor, string source)
             => (await AnalyzeAsync(source)).Where(x => x.Descriptor == descriptor).ToList();
@@ -41,9 +42,9 @@ public {kind} Foo{bases} {{
         [InlineData("[ProtoMember(1)] public Color? V { get; set; } = Color.Blue;")]
         [InlineData("[ProtoMember(1)] public string? V { get; set; } = \"x\";")]
         [InlineData("[ProtoMember(1)] public Msg? V { get; set; } = new();")]
-        [InlineData("[ProtoMember(1)] public List<int>? V { get; set; } = new();")]
-        // neither changes what an absent field reads as
+        // null-wrapped, a collection tells null from empty - and then the initializer loses the null
         [InlineData("[ProtoMember(1), NullWrappedCollection] public List<int>? V { get; set; } = new();")]
+        // neither changes what an absent field reads as
         [InlineData("[ProtoMember(1), DefaultValue(5)] public int? V { get; set; } = 5;")]
         [InlineData("[ProtoMember(1, IsRequired = true)] public int? V { get; set; } = 5;")]
         // ShouldSerialize only decides the write: a null is still not written (probed)
@@ -52,6 +53,9 @@ public {kind} Foo{bases} {{
         [InlineData("[ProtoMember(1)] public int? V { get; set; } = default(int);")]
         [InlineData("[ProtoMember(1)] public int? V { get; set; } = (int)default;")]
         [InlineData("[ProtoMember(1)] public Money? V { get; set; } = (Money)null;")]
+        // an after-callback runs once the fields are read, too late to tell a null that was sent
+        [InlineData(@"[ProtoMember(1)] public int? V { get; set; } = 5;
+                      [ProtoAfterDeserialization] public void After() { if (V > 10) V = 10; }")]
         // a callback that resets something else does not count
         [InlineData(@"[ProtoMember(1)] public int? V { get; set; } = 5;
                       public int Other { get; set; }
@@ -64,8 +68,7 @@ public {kind} Foo{bases} {{
             Assert.StartsWith("'V' is nullable, but its initializer gives it a value; null is not written, so a null comes back as that value",
                 diag.GetMessage(CultureInfo.InvariantCulture));
 
-            var span = diag.Location.SourceSpan;
-            Assert.Equal("V", (await diag.Location.SourceTree!.GetTextAsync()).ToString().Substring(span.Start, span.Length));
+            Assert.Equal("V", diag.Location.SourceTree!.GetText(TestContext.Current.CancellationToken).ToString(diag.Location.SourceSpan));
         }
 
         [Fact]
@@ -202,6 +205,10 @@ public partial class Foo
         [InlineData("[ProtoContract]", "[ProtoMember(1)] public int? V { get; set; } = 5; public bool VSpecified { get; set; }")]
         // the documented remedy that keeps the initializer for instances built in code
         [InlineData("[ProtoContract]", "[ProtoMember(1)] public int? V { get; set; } = 5; [ProtoBeforeDeserialization] public void Reset() => V = null;")]
+        [InlineData("[ProtoContract]", "[ProtoMember(1)] public int? V { get; set; } = 5; [System.Runtime.Serialization.OnDeserializing] public void Reset(System.Runtime.Serialization.StreamingContext _) => V = null;")]
+        // without null-wrapping a collection writes null and empty alike, so one comes back as the
+        // other with or without the initializer; that is not the initializer's doing
+        [InlineData("[ProtoContract]", "[ProtoMember(1)] public List<int>? V { get; set; } = new();")]
         // no initializer runs on deserialize, so the null survives (probed)
         [InlineData("[ProtoContract(SkipConstructor = true)]", "[ProtoMember(1)] public int? V { get; set; } = 5;")]
         [InlineData("[ProtoContract(Surrogate = typeof(Msg))]", "[ProtoMember(1)] public int? V { get; set; } = 5;")]
@@ -256,6 +263,8 @@ public partial class Foo
         [InlineData("[ProtoMember(1)] public Msg Value { get; set; } = new();")]
         [InlineData("[ProtoMember(1)] public byte[] Value { get; set; } = new byte[0];")]
         [InlineData("[ProtoMember(1)] public string Value { get; private set; } = \"\";")]
+        // a contract implementing only the non-generic IEnumerable is a message, not a collection
+        [InlineData("[ProtoMember(1)] public Bag Value { get; set; } = new();")]
         // a callback cannot assign these, so it is not offered
         [InlineData("public readonly object Value = new();", "declare it nullable")]
         [InlineData("public string Value { get; } = \"x\";", "declare it nullable")]
@@ -266,8 +275,8 @@ public partial class Foo
                 NullMemberSource("[ProtoContract(SkipConstructor = true)]", body) + IsExternalInit));
             Assert.Equal(DiagnosticSeverity.Warning, diag.Severity);
             Assert.Equal("'Value' is non-nullable, but SkipConstructor means no constructor or initializer runs on deserialize; "
-                + "it is null whenever the payload does not carry it, which for a member that is not serialized is every time. "
-                + "To fix: " + fixes + ".",
+                + (body.Contains("ProtoMember") ? "it is null whenever the payload does not carry it" : "it is not serialized, so it is null after every deserialize")
+                + ". To fix: " + fixes + ".",
                 diag.GetMessage(CultureInfo.InvariantCulture));
         }
 
@@ -302,8 +311,7 @@ using ProtoBuf;
 [ProtoContract(SkipConstructor = true)]
 public record Person([property: ProtoMember(1)] string Name);
 " + IsExternalInit));
-            var span = diag.Location.SourceSpan;
-            Assert.Equal("Name", (await diag.Location.SourceTree!.GetTextAsync()).ToString().Substring(span.Start, span.Length));
+            Assert.Equal("Name", diag.Location.SourceTree!.GetText(TestContext.Current.CancellationToken).ToString(diag.Location.SourceSpan));
             // init-only, so a callback could not restore it
             Assert.EndsWith(" To fix: declare it nullable.", diag.GetMessage(CultureInfo.InvariantCulture));
         }

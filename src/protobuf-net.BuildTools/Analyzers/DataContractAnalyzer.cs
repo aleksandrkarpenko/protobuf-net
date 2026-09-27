@@ -255,7 +255,7 @@ internal static readonly DiagnosticDescriptor DeclaredAndIgnored = new(
         internal static readonly DiagnosticDescriptor NonNullableMemberLeftNull = new(
             id: "PBN0030",
             title: nameof(DataContractAnalyzer) + "." + nameof(NonNullableMemberLeftNull),
-            messageFormat: "'{0}' is non-nullable, but {1}; it is null whenever the payload does not carry it, which for a member that is not serialized is every time. To fix: {2}.",
+            messageFormat: "'{0}' is non-nullable, but {1}; {2}. To fix: {3}.",
             category: Literals.CategoryUsage,
             defaultSeverity: DiagnosticSeverity.Warning,
             isEnabledByDefault: true,

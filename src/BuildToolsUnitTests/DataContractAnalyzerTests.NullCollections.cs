@@ -44,9 +44,7 @@ public record TestRecord([property: ProtoMember(1)] string[] Array);
             // a positional record's property is init-only, so a callback cannot assign it and is not offered
             Assert.EndsWith("To fix: declare it nullable, or mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format).", message);
 
-            var span = diag.Location.SourceSpan;
-            var text = (await diag.Location.SourceTree!.GetTextAsync()).ToString().Substring(span.Start, span.Length);
-            Assert.Equal("Array", text);
+            Assert.Equal("Array", diag.Location.SourceTree!.GetText(TestContext.Current.CancellationToken).ToString(diag.Location.SourceSpan));
         }
 
         [Theory]
@@ -222,7 +220,7 @@ public class Foo {{
         // the message suggests only what works: an initializer needs a constructor that runs,
         // null-wrapping needs a member that is written, and with no constructor a callback is left
         [Theory]
-        [InlineData("[ProtoContract]", "public List<int> Items { get; set; } = null!;",
+        [InlineData("[ProtoContract]", "[System.Runtime.Serialization.DataMember(Order = 1)] public List<int> Items { get; set; } = null!;",
             "declare it nullable, or initialize it")]
         [InlineData("[ProtoContract(SkipConstructor = true)]", "[ProtoMember(1)] public List<int> Items { get; set; } = new();",
             "declare it nullable, mark it [NullWrappedCollection] so that an empty one is written (this changes the wire format), or restore it in a deserialization callback")]
@@ -380,8 +378,12 @@ public class Derived : Base { }");
         [InlineData("#nullable enable", "[ProtoContract(SkipConstructor = true, Surrogate = typeof(FooSurrogate))]", "[ProtoMember(1)] public List<int> Items { get; set; } = new();")]
         // with no parameterless constructor there is nothing to deserialize into - PBN0015's error
         [InlineData("#nullable enable", "[ProtoContract]", "[ProtoMember(1)] public List<int> Items { get; set; } public Foo(int x) { Items = null!; }")]
-        // an abstract type is constructed through whichever constructor the concrete type picks
+        // an abstract type is constructed through whichever constructor the concrete type picks, so
+        // an assignment in any of them counts
         [InlineData("#nullable enable", "[ProtoContract]", "[ProtoMember(1)] public List<int> Items { get; set; } protected Foo(List<int> items) { Items = items; }", "abstract class")]
+        [InlineData("#nullable enable", "[ProtoContract]", "[ProtoMember(1)] public List<int> Items { get; set; } protected Foo() { } protected Foo(List<int> items) { Items = items; }", "abstract class")]
+        // constructed as usual and never written: whatever the constructor left, deserialized or not
+        [InlineData("#nullable enable", "[ProtoContract]", "public List<int> Cache { get; set; } = null!;")]
         // a hand-written serializer does its own constructing
         [InlineData("#nullable enable", "[ProtoContract(SkipConstructor = true, Serializer = typeof(FooSerializer))]", "[ProtoMember(1)] public List<int> Items { get; set; } = new();")]
         // null-wrapping writes the wrapper even for an empty collection, which then comes back empty
@@ -483,7 +485,61 @@ public record Derived() : Base(new List<int>());
             Assert.Empty(diags);
         }
 
+        // ImplicitFields writes members that carry no attribute at all
+        [Fact]
+        public async Task ReportsImplicitFieldsMember()
+        {
+            var diag = Assert.Single(await NullCollectionDiagnosticsAsync(@"
+#nullable enable
+using ProtoBuf;
+using System.Collections.Generic;
+[ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
+public class Foo {
+    public List<int> Items { get; set; } = null!;
+}"));
+            Assert.StartsWith("'Items' is a non-nullable collection, but nothing assigns it", diag.GetMessage(CultureInfo.InvariantCulture));
+        }
+
+        // only an IEnumerable<T> is a collection to protobuf-net: a contract implementing just the
+        // non-generic IEnumerable is an ordinary message, whose members are read as usual (probed)
+        [Fact]
+        public async Task ReportsOnContractThatIsOnlyNonGenericEnumerable()
+        {
+            var diag = Assert.Single(await NullCollectionDiagnosticsAsync(@"
+#nullable enable
+using ProtoBuf;
+using System.Collections.Generic;
+[ProtoContract(SkipConstructor = true)]
+public class Foo : System.Collections.IEnumerable {
+    [ProtoMember(1)] public List<int> Items { get; set; } = new();
+    public System.Collections.IEnumerator GetEnumerator() => null!;
+}"));
+            Assert.StartsWith("'Items' is a non-nullable collection, but SkipConstructor means", diag.GetMessage(CultureInfo.InvariantCulture));
+        }
+
         // a partial type is visited once per declaration, and each member must be reported once
+        [Fact]
+        public async Task ReportsOncePerMemberAcrossPartialDeclarationsInOneFile()
+        {
+            var diags = (await NullCollectionDiagnosticsAsync(@"
+#nullable enable
+using ProtoBuf;
+using System.Collections.Generic;
+[ProtoContract(SkipConstructor = true)]
+public partial class Foo
+{
+    [ProtoMember(1)] public List<int> First { get; set; } = new();
+}
+public partial class Foo
+{
+    public List<int> Second { get; set; } = new();
+}")).Select(x => x.GetMessage(CultureInfo.InvariantCulture)).OrderBy(x => x).ToList();
+
+            Assert.Equal(2, diags.Count);
+            Assert.StartsWith("'First'", diags[0]);
+            Assert.StartsWith("'Second'", diags[1]);
+        }
+
         [Fact]
         public async Task ReportsOncePerMemberAcrossPartialDeclarations()
         {
